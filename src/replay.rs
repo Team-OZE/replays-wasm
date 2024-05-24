@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::hint::black_box;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
@@ -6,18 +7,76 @@ use flate2::{Decompress, FlushDecompress};
 use wasm_bindgen::prelude::wasm_bindgen;
 use log::{info, warn};
 use num_derive::FromPrimitive;
-use serde::Serialize;
+use num_traits::FromPrimitive;
+use serde::{Serialize, Serializer};
+use web_sys::console::info;
+use crate::replay::SlotRace::UNKNOWN;
 use crate::utils;
 
+#[derive(Serialize, FromPrimitive, Debug)]
+enum SlotColor {
+    RED = 1,
+    BLUE = 2,
+    TEAL = 3,
+    PURPLE = 4,
+    YELLOW = 5,
+    ORANGE = 6,
+    GREEN = 7,
+    PINK = 8,
+    GRAY = 9,
+    LIGHTBLUE = 10,
+    DARKGREEN = 11,
+    BROWN = 12,
+    MAROON = 13,
+    NAVY = 14,
+    TURQUOISE = 15,
+    VIOLET = 16,
+    WHEAT = 17,
+    PEACH = 18,
+    MINT = 19,
+    LAVENDER = 20,
+    COAL = 21,
+    SNOW = 22,
+    EMERALD = 23,
+    PEANUT = 24,
+    OBSERVER = 25,
+    UNKNOWN = 127
+}
+
+#[derive(Serialize, FromPrimitive, Debug)]
+enum SlotRace {
+    HUMAN = 1,
+    ORC = 2,
+    NIGHTELF = 4,
+    UNDEAD = 8,
+    RANDOM = 20,
+    FIXED = 40,
+    UNKNOWN = 127
+}
+
+#[derive(Serialize, FromPrimitive, Debug)]
+enum ComputerAIStrength {
+    EASY = 0,
+    NORMAL = 1,
+    INSANE = 2,
+    UNKNOWN = 127
+}
+
+#[derive(Serialize, FromPrimitive, Debug)]
+enum SlotStatus {
+    EMPTY = 0,
+    CLOSED = 1,
+    OCCUPIED = 2,
+    UNKNOWN = 127
+}
 #[derive(Serialize)]
-pub struct ReplayMeta {
-    saving_player_battle_tag: String,
+struct ReplayMeta {
+    saving_player_id: u8,
     is_saving_player_host: bool,
     game_name: String,
     map_name: String,
     game_creator_battle_tag: String
 }
-
 
 #[derive(Serialize)]
 struct GameSettings {
@@ -36,10 +95,30 @@ struct GameSettings {
 }
 
 #[derive(Serialize)]
+struct Slot {
+    player_id: u8,
+    map_download_percent: u8,
+    status: SlotStatus,
+    is_computer: bool,
+    team_index: u8,
+    color: SlotColor,
+    race: SlotRace,
+    ai_strength: ComputerAIStrength,
+    hadnicap_percent: u8
+}
+
+#[derive(Serialize, Debug)]
+struct ReplayPlayer {
+    battle_tag: String
+}
+
+#[derive(Serialize)]
 pub struct Replay {
     pub version: u8,
     metadata: ReplayMeta,
-    game_settings: GameSettings
+    game_settings: GameSettings,
+    slots: Vec<Slot>,
+    players: HashMap<u8, ReplayPlayer>
 }
 
 fn parse_dword(bytes: &[u8]) -> u32 {
@@ -255,13 +334,100 @@ impl Replay {
         cursor_skip_bytes(&mut cursor, 4);
 
         // 4.9 [PlayerList]
+        let mut player_list:HashMap<u8, ReplayPlayer> = HashMap::new();
+        player_list.insert(player_id, ReplayPlayer { battle_tag: player_name.clone() });
+        let mut next_record_id = cursor_read_byte(&mut cursor);
+        while next_record_id == 0x00 || next_record_id == 0x16 {
+            let cur_player_id = cursor_read_byte(&mut cursor);
+            // cursor_skip_bytes(&mut cursor, 4);;
+            let cur_player_name = cursor_read_nullterminated_string(&mut cursor);
+            let additional_data_size_byte = cursor_read_byte(&mut cursor);
+            cursor_skip_bytes(&mut cursor, additional_data_size_byte as i64);
+            player_list.insert(cur_player_id, ReplayPlayer { battle_tag: cur_player_name });
+            next_record_id = cursor_read_byte(&mut cursor);
+        }
+        info!("Loaded player list: {:?}", player_list);
+
+        // Reforged player metadata
+        while next_record_id == 0x39 {
+            let cur_record_subtype = cursor_read_byte(&mut cursor);
+            let cur_record_data_length = cursor_read_dword(&mut cursor);
+
+            cursor_skip_bytes(&mut cursor, cur_record_data_length as i64);
+            // TODO: Maybe parse this data too
+
+            next_record_id = cursor_read_byte(&mut cursor);
+        }
+
+        // 4.10 [GameStartRecord]
+        if next_record_id != 0x19 {
+            let mut buf = [0u8; 128];
+            cursor.read_exact(&mut buf).unwrap();
+            panic!("GameStartRecord did not follow PlayerList: next record id = {:?}. Following bytes: {:?}", next_record_id, buf)
+        }
+
+        let data_length = cursor_read_word(&mut cursor);
+        let count_slotrecords = cursor_read_byte(&mut cursor);
+        let mut i = 0u8;
+
+        let mut slots: Vec<Slot> = Vec::with_capacity(count_slotrecords as usize);
+
+        while i < count_slotrecords {
+            let cur_slot_player_id = cursor_read_byte(&mut cursor);
+            let cur_slot_map_download_percent = cursor_read_byte(&mut cursor);
+            let status_byte = cursor_read_byte(&mut cursor);
+            let cur_slot_status = SlotStatus::from_u8(status_byte)
+                .or(Option::from(SlotStatus::UNKNOWN))
+                .unwrap();
+            let cur_slot_is_computer_player = cursor_read_byte(&mut cursor) == 1;
+            let cur_slot_team_index = cursor_read_byte(&mut cursor);
+            let color_byte = cursor_read_byte(&mut cursor);
+            let cur_slot_color =
+                SlotColor::from_u8(color_byte + 1)
+                    .or(Option::from(SlotColor::UNKNOWN))
+                    .unwrap();
+            let race_byte = cursor_read_byte(&mut cursor);
+            let cur_slot_player_race =
+                SlotRace::from_u8(race_byte)
+                    .or(Option::from(UNKNOWN))
+                    .unwrap();
+            let cur_slot_player_computer_ai_strenth =
+                ComputerAIStrength::from_u8(cursor_read_byte(&mut cursor))
+                    .or(Option::from(ComputerAIStrength::UNKNOWN))
+                    .unwrap();
+            let cur_slot_handicap_percent = cursor_read_byte(&mut cursor);
+
+            info!("Player slot record read: pid = {:?} status = {:?} is_comp = {:?} team = {:?} color = {:?} ({:?}) race = {:?} ({:?})",
+                cur_slot_player_id, cur_slot_status, cur_slot_is_computer_player, cur_slot_team_index, cur_slot_color, color_byte, cur_slot_player_race, race_byte);
+
+            slots.push(Slot {
+                player_id: cur_slot_player_id,
+                map_download_percent: cur_slot_map_download_percent,
+                status: cur_slot_status,
+                is_computer: cur_slot_is_computer_player,
+                team_index: cur_slot_team_index,
+                color: cur_slot_color,
+                race: cur_slot_player_race,
+                ai_strength: cur_slot_player_computer_ai_strenth,
+                hadnicap_percent: cur_slot_handicap_percent,
+            });
+
+            i+=1;
+        }
+
+        let random_seed = cursor_read_dword(&mut cursor);
+        info!("Random seed: {:?}", random_seed);
+        let selection_mode = cursor_read_byte(&mut cursor);
+        info!("Selection mode: {:?}", selection_mode);
+        let start_spot_count = cursor_read_byte(&mut cursor);
+        info!("Start spots count: {:?}", start_spot_count);
 
         return Replay {
             version: *version,
             metadata: ReplayMeta {
                 game_name,
                 is_saving_player_host: player_is_host,
-                saving_player_battle_tag: player_name,
+                saving_player_id: player_id,
                 map_name,
                 game_creator_battle_tag: game_creator_name
             },
@@ -278,7 +444,9 @@ impl Replay {
                 teams_together,
                 obs_mode,
                 game_speed
-            }
+            },
+            slots,
+            players: player_list
         };
     }
 }
