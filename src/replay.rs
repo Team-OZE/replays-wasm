@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -69,6 +70,30 @@ enum SlotStatus {
     OCCUPIED = 2,
     UNKNOWN = 127
 }
+
+#[derive(Serialize, FromPrimitive, Debug)]
+enum LeaveReason {
+    CONNECTION_CLOSED_BY_REMOTE_GAME = 0x01,
+    CONNECTION_CLOSED_BY_LOCAL_GAME = 0x0C,
+    UNKNOWN
+}
+
+#[derive(Serialize, FromPrimitive, Debug)]
+enum ActionType {
+    PAUSE = 0x01,
+    RESUME = 0x02,
+
+    MINIMAP_SIGNAL = 0x68,
+
+    UNKNOWN
+}
+
+#[derive(Serialize, Debug)]
+struct MinimapLocation {
+    x: u32,
+    y: u32
+}
+
 #[derive(Serialize)]
 struct ReplayMeta {
     saving_player_id: u8,
@@ -109,7 +134,31 @@ struct Slot {
 
 #[derive(Serialize, Debug)]
 struct ReplayPlayer {
-    battle_tag: String
+    battle_tag: String,
+    leave_reason: LeaveReason,
+    result_byte: u8
+}
+
+#[derive(Serialize, Debug)]
+struct ChatMessage {
+    sender_player_id: u8,
+    recepient_slot_number: i8,
+    flag: u8,
+    message: String,
+    timestamp: u64
+}
+
+#[derive(Serialize)]
+struct ActionData {
+    location: Option<MinimapLocation>
+}
+
+#[derive(Serialize)]
+struct Action {
+    player_id: u8,
+    timestamp: u64,
+    action_type: ActionType,
+    data: Option<ActionData>
 }
 
 #[derive(Serialize)]
@@ -118,7 +167,9 @@ pub struct Replay {
     metadata: ReplayMeta,
     game_settings: GameSettings,
     slots: Vec<Slot>,
-    players: HashMap<u8, ReplayPlayer>
+    players: HashMap<u8, ReplayPlayer>,
+    chat: Vec<ChatMessage>,
+    actions: Vec<Action>
 }
 
 fn parse_dword(bytes: &[u8]) -> u32 {
@@ -152,6 +203,7 @@ fn cursor_read_word<T>(cursor: &mut Cursor<T>) -> u16 where T: AsRef<[u8]> {
 fn cursor_read_nullterminated_string<T>(cursor: &mut Cursor<T>) -> String where T: AsRef<[u8]> {
     let mut string_buf: Vec<u8> = vec![];
     cursor.read_until(0x00, &mut string_buf).unwrap();
+
     let string = String::from_utf8_lossy(&string_buf[..string_buf.len()-1]);
     return string.to_string()
 }
@@ -334,8 +386,14 @@ impl Replay {
         cursor_skip_bytes(&mut cursor, 4);
 
         // 4.9 [PlayerList]
-        let mut player_list:HashMap<u8, ReplayPlayer> = HashMap::new();
-        player_list.insert(player_id, ReplayPlayer { battle_tag: player_name.clone() });
+        let mut player_list: HashMap<u8, ReplayPlayer> = HashMap::new();
+        player_list.insert(player_id,
+                           ReplayPlayer {
+                               battle_tag: player_name.clone(),
+                               leave_reason: LeaveReason::UNKNOWN,
+                               result_byte: 0
+                           }
+        );
         let mut next_record_id = cursor_read_byte(&mut cursor);
         while next_record_id == 0x00 || next_record_id == 0x16 {
             let cur_player_id = cursor_read_byte(&mut cursor);
@@ -343,7 +401,11 @@ impl Replay {
             let cur_player_name = cursor_read_nullterminated_string(&mut cursor);
             let additional_data_size_byte = cursor_read_byte(&mut cursor);
             cursor_skip_bytes(&mut cursor, additional_data_size_byte as i64);
-            player_list.insert(cur_player_id, ReplayPlayer { battle_tag: cur_player_name });
+            player_list.insert(cur_player_id, ReplayPlayer {
+                battle_tag: cur_player_name,
+                leave_reason: LeaveReason::UNKNOWN,
+                result_byte: 0
+            });
             next_record_id = cursor_read_byte(&mut cursor);
         }
         info!("Loaded player list: {:?}", player_list);
@@ -422,6 +484,294 @@ impl Replay {
         let start_spot_count = cursor_read_byte(&mut cursor);
         info!("Start spots count: {:?}", start_spot_count);
 
+        // 5.0 [ReplayData]
+
+        // 0x17 LeaveGame
+        let from_index = cursor.position();
+        let mut next_record_id = cursor_read_byte(&mut cursor);
+        let mut chat: Vec<ChatMessage> = vec![];
+        let mut current_timestamp: u64 = 0;
+        let mut records: HashMap<u8, u64> = HashMap::new();
+        let mut action_records: HashMap<u8, u64> = HashMap::new();
+        let mut actions: Vec<Action> = vec![];
+
+        loop {
+            // info!("Position {:?}, record {:?}", cursor.position() - 1, next_record_id);
+            match next_record_id {
+                0x17 => {
+                    let leave_reason_byte = cursor_read_dword(&mut cursor);
+                    let cur_leave_reason = LeaveReason::from_u32(leave_reason_byte).or(Option::from(LeaveReason::UNKNOWN)).unwrap();
+                    let cur_player_id = cursor_read_byte(&mut cursor);
+                    let cur_result = cursor_read_dword(&mut cursor);
+                    cursor_skip_bytes(&mut cursor, 4);
+
+                    info!("{:?} {:?}", cur_leave_reason, cur_result);
+                    player_list.entry(cur_player_id).and_modify(|r| {
+                            r.leave_reason = cur_leave_reason;
+                            r.result_byte = cur_result as u8;
+                        }
+                    );
+                },
+                0x1A => {
+                    cursor_skip_bytes(&mut cursor, 4);
+                },
+                0x1B => {
+                    cursor_skip_bytes(&mut cursor, 4);
+                },
+                0x1C => {
+                    cursor_skip_bytes(&mut cursor, 4);
+                },
+                0x1E | 0x1F => {
+                    let mut len_following = cursor_read_word(&mut cursor);
+                    let increment = cursor_read_word(&mut cursor);
+                    // info!("Time increment: {:?}", increment);
+                    current_timestamp += increment as u64;
+                    len_following -= 2;
+                    let total_len_following = len_following.clone();
+                    let cursor_position_before_data_read = cursor.position();
+
+                    if len_following > 3 {
+                        loop {
+                            let cur_action_player_id = cursor_read_byte(&mut cursor);
+                            let cur_action_blocks_length = cursor_read_word(&mut cursor);
+                            len_following -= 3;
+
+                            let position_before_read = cursor.position();
+                            let mut cur_read_bytes = 0;
+                            while cur_read_bytes < cur_action_blocks_length {
+                                let cur_position_before_read = cursor.position();
+
+                                let cur_action_id = cursor_read_byte(&mut cursor);
+                                if !action_records.contains_key(&cur_action_id)  {
+                                    action_records.insert(cur_action_id, 1);
+                                }
+                                else {
+                                    action_records.entry(cur_action_id).and_modify(|x| { *x += 1; });
+                                }
+
+                                let mut action = Action {
+                                    player_id: cur_action_player_id,
+                                    action_type: ActionType::from_u8(cur_action_id).or(Option::from(ActionType::UNKNOWN)).unwrap(),
+                                    timestamp: current_timestamp,
+                                    data: None,
+                                };
+
+                                match cur_action_id {
+                                    0x01 => {},
+                                    0x02 => {},
+                                    0x03 => {
+                                        let new_game_speed = cursor_read_byte(&mut cursor);
+                                    },
+                                    0x04 => {},
+                                    0x05 => {},
+                                    0x06 => {
+                                        let savegame_name = cursor_read_nullterminated_string(&mut cursor);
+                                    },
+                                    0x07 => {
+                                        cursor_skip_bytes(&mut cursor, 4);
+                                    },
+                                    0x10 => {
+                                       cursor_skip_bytes(&mut cursor, 14);
+                                    },
+                                    0x11 => {
+                                        cursor_skip_bytes(&mut cursor, 22);
+                                    },
+                                    0x12 => {
+                                        cursor_skip_bytes(&mut cursor, 30);
+                                    },
+                                    0x13 => {
+                                        cursor_skip_bytes(&mut cursor, 38);
+                                    },
+                                    0x14 => {
+                                        cursor_skip_bytes(&mut cursor, 43);
+                                    },
+                                    0x16 => {
+                                        let select_mode_byte = cursor_read_byte(&mut cursor);
+                                        let num_units = cursor_read_word(&mut cursor);
+                                        cursor_skip_bytes(&mut cursor, 8*num_units as i64);
+                                    },
+                                    0x17 => {
+                                        let group_num = cursor_read_byte(&mut cursor);
+                                        let items_count = cursor_read_word(&mut cursor);
+                                        cursor_skip_bytes(&mut cursor, 8*items_count as i64);
+                                    },
+                                    0x18 => {
+                                        cursor_skip_bytes(&mut cursor, 2);
+                                    },
+                                    0x19 => {
+                                        cursor_skip_bytes(&mut cursor, 12);
+                                    },
+                                    0x1A => {},
+                                    0x1B => {
+                                        cursor_skip_bytes(&mut cursor, 9);
+                                    },
+                                    0x1C => {
+                                        cursor_skip_bytes(&mut cursor, 9);
+                                    },
+                                    0x1D => {
+                                        cursor_skip_bytes(&mut cursor, 8);
+                                    },
+                                    0x1E => {
+                                        cursor_skip_bytes(&mut cursor, 5);
+                                    },
+                                    0x21 => {
+                                        cursor_skip_bytes(&mut cursor, 8);
+                                    },
+
+                                    0x20 => {},
+                                    0x22 => {},
+                                    0x23 => {},
+                                    0x24 => {},
+                                    0x25 => {},
+                                    0x26 => {},
+                                    0x27 => {
+                                        cursor_skip_bytes(&mut cursor, 5);
+                                    },
+                                    0x29 => {},
+                                    0x2A => {},
+                                    0x2B => {},
+                                    0x2C => {},
+                                    0x2D => {
+                                        cursor_skip_bytes(&mut cursor, 5);
+                                    },
+                                    0x2E => {
+                                        cursor_skip_bytes(&mut cursor, 4);
+                                    },
+                                    0x2F => {},
+                                    0x30 => {},
+                                    0x31 => {},
+                                    0x32 => {},
+
+                                    0x50 => {
+                                        cursor_skip_bytes(&mut cursor, 5);
+                                    },
+                                    0x51 => {
+                                        cursor_skip_bytes(&mut cursor, 9);
+                                    },
+
+                                    // W3C Replays: Chat messages stored here
+                                    0x60 => {
+                                        let mut buf = vec![];
+                                        buf.resize(8, 0);
+                                        cursor.read_exact(&mut buf).unwrap();
+                                        let command = cursor_read_nullterminated_string(&mut cursor);
+                                        info!("Chat command: {} {:?}", command, buf);
+                                        chat.push(ChatMessage {
+                                            message: command,
+                                            timestamp: current_timestamp,
+                                            flag: 255,
+                                            recepient_slot_number: 127,
+                                            sender_player_id: cur_action_player_id
+                                        })
+                                    },
+                                    0x61 => {},
+                                    0x62 => {
+                                        cursor_skip_bytes(&mut cursor, 12);
+                                    },
+                                    0x66 => {},
+                                    0x67 => {},
+                                    0x68 => {
+                                        let x = cursor_read_dword(&mut cursor);
+                                        let y = cursor_read_dword(&mut cursor);
+                                        action.data = Option::from(ActionData {
+                                            location: Option::from(MinimapLocation {
+                                                x,
+                                                y
+                                            })
+                                        })
+                                    },
+                                    0x69 => {
+                                        cursor_skip_bytes(&mut cursor, 16);
+                                    },
+                                    0x6A => {
+                                        cursor_skip_bytes(&mut cursor, 16);
+                                    },
+                                    0x75 => {
+                                        cursor_skip_bytes(&mut cursor, 1);
+                                    },
+
+                                    // Unknown
+                                    0x7a => {
+                                        cursor_skip_bytes(&mut cursor, 20);
+                                    },
+                                    0x7b => {
+                                        cursor_skip_bytes(&mut cursor, 16);
+                                    },
+
+                                    _ => {
+                                        let cur_pos = cursor.position().clone();
+                                        let left_bytes = cur_action_blocks_length as u64 - cur_pos + position_before_read;
+                                        warn!("({}) Unknown action id: {:#04x}. Read bytes so far: {:?}. Total expected: {:?}", cur_read_bytes, cur_action_id, cur_pos - position_before_read, cur_action_blocks_length);
+                                        let mut buf = vec![];
+                                        buf.resize(left_bytes as usize, 0);
+                                        cursor.read_exact(&mut buf).unwrap();
+                                        info!("Following bytes: {:?}", buf);
+                                        break;
+                                    }
+                                }
+
+                                actions.push(action);
+
+                                let cur_bytes = (cursor.position().clone() - cur_position_before_read) as u16;
+                                cur_read_bytes += cur_bytes;
+                            }
+
+                            len_following -= (cursor.position() - position_before_read) as u16;
+
+                            if len_following < 1 { break }
+                        }
+                    }
+
+                    if(cursor.position() - cursor_position_before_data_read != total_len_following as u64) {
+                        warn!("Mismatch: {:?}/{:?}", cursor.position() - cursor_position_before_data_read, total_len_following);
+                    }
+
+                    // cursor_skip_bytes(&mut cursor, (len_following - 2) as i64);
+                },
+                0x20 => {
+                    let cur_player_id = cursor_read_byte(&mut cursor);
+                    // let len_following = cursor_read_word(&mut cursor);
+                    cursor_skip_bytes(&mut cursor, 2);
+                    let cur_flag = cursor_read_byte(&mut cursor);
+                    let cur_recepient_slotnumber: i8 = (cursor_read_dword(&mut cursor) - 2) as i8;
+                    let cur_message = cursor_read_nullterminated_string(&mut cursor);
+                    chat.push(ChatMessage {
+                        sender_player_id: cur_player_id,
+                        flag: cur_flag,
+                        recepient_slot_number: cur_recepient_slotnumber,
+                        message: cur_message,
+                        timestamp: current_timestamp
+                    })
+                },
+                0x22 => {
+                    cursor_skip_bytes(&mut cursor, 5);
+                },
+                0x23 => {
+                    cursor_skip_bytes(&mut cursor, 10);
+                },
+                0x2F => {
+                    cursor_skip_bytes(&mut cursor, 8);
+                },
+                0x00 => {
+                    info!("Exiting at null. Position: {:?}", cursor.position());
+                    break
+                }
+                _ => {
+                    info!("ReplayData: Unknown record id ({:#04x})", next_record_id);
+                    break
+                }
+            }
+            if !records.contains_key(&next_record_id) {
+                records.insert(next_record_id, 1);
+            }
+            else {
+                records.entry(next_record_id).and_modify(|x| { *x += 1; });
+            }
+            next_record_id = cursor_read_byte(&mut cursor);
+        }
+        info!("Records: {:?}", records);
+        info!("Action records: {:?}", action_records);
+
         return Replay {
             version: *version,
             metadata: ReplayMeta {
@@ -446,7 +796,9 @@ impl Replay {
                 game_speed
             },
             slots,
-            players: player_list
+            players: player_list,
+            chat,
+            actions
         };
     }
 }
