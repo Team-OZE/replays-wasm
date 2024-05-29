@@ -1,7 +1,6 @@
 mod utils;
 mod replay;
 
-use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use crate::replay::Replay;
 

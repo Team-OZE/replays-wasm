@@ -136,7 +136,8 @@ struct Slot {
 struct ReplayPlayer {
     battle_tag: String,
     leave_reason: LeaveReason,
-    result_byte: u8
+    result_byte: u8,
+    left_at: u64
 }
 
 #[derive(Serialize, Debug)]
@@ -391,7 +392,8 @@ impl Replay {
                            ReplayPlayer {
                                battle_tag: player_name.clone(),
                                leave_reason: LeaveReason::UNKNOWN,
-                               result_byte: 0
+                               result_byte: 0,
+                               left_at: 0,
                            }
         );
         let mut next_record_id = cursor_read_byte(&mut cursor);
@@ -404,7 +406,8 @@ impl Replay {
             player_list.insert(cur_player_id, ReplayPlayer {
                 battle_tag: cur_player_name,
                 leave_reason: LeaveReason::UNKNOWN,
-                result_byte: 0
+                result_byte: 0,
+                left_at: 0,
             });
             next_record_id = cursor_read_byte(&mut cursor);
         }
@@ -494,6 +497,7 @@ impl Replay {
         let mut records: HashMap<u8, u64> = HashMap::new();
         let mut action_records: HashMap<u8, u64> = HashMap::new();
         let mut actions: Vec<Action> = vec![];
+        let mut last_leaver_index: u8 = 0;
 
         loop {
             // info!("Position {:?}, record {:?}", cursor.position() - 1, next_record_id);
@@ -511,6 +515,7 @@ impl Replay {
                             r.result_byte = cur_result as u8;
                         }
                     );
+                    last_leaver_index = cur_player_id;
                 },
                 0x1A => {
                     cursor_skip_bytes(&mut cursor, 4);
@@ -535,6 +540,8 @@ impl Replay {
                             let cur_action_player_id = cursor_read_byte(&mut cursor);
                             let cur_action_blocks_length = cursor_read_word(&mut cursor);
                             len_following -= 3;
+
+                            player_list.entry(cur_action_player_id).and_modify(|x| x.left_at = current_timestamp);
 
                             let position_before_read = cursor.position();
                             let mut cur_read_bytes = 0;
@@ -649,20 +656,23 @@ impl Replay {
                                         cursor_skip_bytes(&mut cursor, 9);
                                     },
 
-                                    // W3C Replays: Chat messages stored here
                                     0x60 => {
                                         let mut buf = vec![];
                                         buf.resize(8, 0);
                                         cursor.read_exact(&mut buf).unwrap();
                                         let command = cursor_read_nullterminated_string(&mut cursor);
                                         info!("Chat command: {} {:?}", command, buf);
-                                        chat.push(ChatMessage {
-                                            message: command,
-                                            timestamp: current_timestamp,
-                                            flag: 255,
-                                            recepient_slot_number: 127,
-                                            sender_player_id: cur_action_player_id
-                                        })
+
+                                        // W3C Replays: Chat messages stored here, but in other replays messages here might shadow chatmessages
+                                        if chat.iter().rfind(|el| el.message == command && el.timestamp.abs_diff(current_timestamp) < 500).is_none() {
+                                            chat.push(ChatMessage {
+                                                message: command,
+                                                timestamp: current_timestamp,
+                                                flag: 255,
+                                                recepient_slot_number: 127,
+                                                sender_player_id: cur_action_player_id
+                                            })
+                                        }
                                     },
                                     0x61 => {},
                                     0x62 => {
@@ -725,12 +735,9 @@ impl Replay {
                     if(cursor.position() - cursor_position_before_data_read != total_len_following as u64) {
                         warn!("Mismatch: {:?}/{:?}", cursor.position() - cursor_position_before_data_read, total_len_following);
                     }
-
-                    // cursor_skip_bytes(&mut cursor, (len_following - 2) as i64);
                 },
                 0x20 => {
                     let cur_player_id = cursor_read_byte(&mut cursor);
-                    // let len_following = cursor_read_word(&mut cursor);
                     cursor_skip_bytes(&mut cursor, 2);
                     let cur_flag = cursor_read_byte(&mut cursor);
                     let cur_recepient_slotnumber: i8 = (cursor_read_dword(&mut cursor) - 2) as i8;
@@ -772,12 +779,22 @@ impl Replay {
         info!("Records: {:?}", records);
         info!("Action records: {:?}", action_records);
 
+        //
+        let mut saving_player_candidate_ids = player_list.keys().filter( |k| match player_list[k].leave_reason {
+            LeaveReason::CONNECTION_CLOSED_BY_LOCAL_GAME => true,
+            _ => false
+        });
+
+        let saving_player_id: Option<&u8> =
+            if saving_player_candidate_ids.clone().count() == 1 { Option::from(saving_player_candidate_ids.next()) }
+            else { saving_player_candidate_ids.find(|k| player_list[k].battle_tag != "FLO") };
+
         return Replay {
             version: *version,
             metadata: ReplayMeta {
                 game_name,
                 is_saving_player_host: player_is_host,
-                saving_player_id: player_id,
+                saving_player_id: last_leaver_index,
                 map_name,
                 game_creator_battle_tag: game_creator_name
             },
