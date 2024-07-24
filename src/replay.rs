@@ -146,8 +146,8 @@ struct ReplayPlayer {
 #[derive(Serialize, Debug)]
 struct ChatMessage {
     sender_player_id: u8,
-    recipient_slot_number: i8,
-    flag: u8,
+    recipient_slot_number: Option<i8>,
+    flag: Option<u8>,
     message: String,
     timestamp: u64
 }
@@ -679,8 +679,8 @@ impl Replay {
                                             chat.push(ChatMessage {
                                                 message: command,
                                                 timestamp: current_timestamp,
-                                                flag: 255,
-                                                recipient_slot_number: 127,
+                                                flag: None,
+                                                recipient_slot_number: None,
                                                 sender_player_id: cur_action_player_id
                                             })
                                         }
@@ -756,8 +756,8 @@ impl Replay {
                     let cur_message = cursor_read_nullterminated_string(&mut cursor);
                     chat.push(ChatMessage {
                         sender_player_id: cur_player_id,
-                        flag: cur_flag,
-                        recipient_slot_number: cur_recepient_slotnumber,
+                        flag: Option::from(cur_flag),
+                        recipient_slot_number: Option::from(cur_recepient_slotnumber),
                         message: cur_message,
                         timestamp: current_timestamp
                     })
