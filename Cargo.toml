@@ -1,6 +1,6 @@
 [package]
 name = "replays-wa"
-version = "0.1.0"
+version = "0.1.2"
 authors = ["Cloud9 <wolke@team-oze.org>"]
 edition = "2018"
 
