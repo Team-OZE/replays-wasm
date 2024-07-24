@@ -83,6 +83,9 @@ enum ActionType {
     PAUSE = 0x01,
     RESUME = 0x02,
 
+    SAVE_GAME = 0x06,
+    SAVE_GAME_DONE = 0x07,
+
     MINIMAP_SIGNAL = 0x68,
 
     UNKNOWN
@@ -129,7 +132,7 @@ struct Slot {
     color: SlotColor,
     race: SlotRace,
     ai_strength: ComputerAIStrength,
-    hadnicap_percent: u8
+    handicap_percent: u8
 }
 
 #[derive(Serialize, Debug)]
@@ -143,7 +146,7 @@ struct ReplayPlayer {
 #[derive(Serialize, Debug)]
 struct ChatMessage {
     sender_player_id: u8,
-    recepient_slot_number: i8,
+    recipient_slot_number: i8,
     flag: u8,
     message: String,
     timestamp: u64
@@ -151,7 +154,10 @@ struct ChatMessage {
 
 #[derive(Serialize)]
 struct ActionData {
-    location: Option<MinimapLocation>
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<MinimapLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    savegame_name: Option<String>
 }
 
 #[derive(Serialize)]
@@ -159,6 +165,7 @@ struct Action {
     player_id: u8,
     timestamp: u64,
     action_type: ActionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<ActionData>
 }
 
@@ -474,7 +481,7 @@ impl Replay {
                 color: cur_slot_color,
                 race: cur_slot_player_race,
                 ai_strength: cur_slot_player_computer_ai_strenth,
-                hadnicap_percent: cur_slot_handicap_percent,
+                handicap_percent: cur_slot_handicap_percent,
             });
 
             i+=1;
@@ -573,6 +580,10 @@ impl Replay {
                                     0x05 => {},
                                     0x06 => {
                                         let savegame_name = cursor_read_nullterminated_string(&mut cursor);
+                                        action.data = Option::from(ActionData {
+                                            location: None,
+                                            savegame_name: Option::from(savegame_name),
+                                        })
                                     },
                                     0x07 => {
                                         cursor_skip_bytes(&mut cursor, 4);
@@ -669,7 +680,7 @@ impl Replay {
                                                 message: command,
                                                 timestamp: current_timestamp,
                                                 flag: 255,
-                                                recepient_slot_number: 127,
+                                                recipient_slot_number: 127,
                                                 sender_player_id: cur_action_player_id
                                             })
                                         }
@@ -687,7 +698,8 @@ impl Replay {
                                             location: Option::from(MinimapLocation {
                                                 x,
                                                 y
-                                            })
+                                            }),
+                                            savegame_name: None
                                         })
                                     },
                                     0x69 => {
@@ -745,7 +757,7 @@ impl Replay {
                     chat.push(ChatMessage {
                         sender_player_id: cur_player_id,
                         flag: cur_flag,
-                        recepient_slot_number: cur_recepient_slotnumber,
+                        recipient_slot_number: cur_recepient_slotnumber,
                         message: cur_message,
                         timestamp: current_timestamp
                     })
