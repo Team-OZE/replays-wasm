@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::hint::black_box;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::panic::Location;
 use flate2::{Decompress, FlushDecompress};
 use wasm_bindgen::prelude::wasm_bindgen;
 use log::{info, warn};
@@ -78,7 +79,7 @@ enum LeaveReason {
     UNKNOWN
 }
 
-#[derive(Serialize, FromPrimitive, Debug)]
+#[derive(Serialize, FromPrimitive, Debug, PartialEq)]
 enum ActionType {
     PAUSE = 0x01,
     RESUME = 0x02,
@@ -86,15 +87,22 @@ enum ActionType {
     SAVE_GAME = 0x06,
     SAVE_GAME_DONE = 0x07,
 
+    ABILITY_BASIC = 0x10,
+    ABILITY_WITH_TARGET_LOCATION = 0x11,
+
+    CHANGE_SELECTION = 0x16,
+    GROUP_ASSIGN = 0x17,
+    GROUP_SELECT = 0x18,
+
     MINIMAP_SIGNAL = 0x68,
 
     UNKNOWN
 }
 
 #[derive(Serialize, Debug)]
-struct MinimapLocation {
-    x: u32,
-    y: u32
+struct MapLocation {
+    x: f32,
+    y: f32
 }
 
 #[derive(Serialize)]
@@ -153,11 +161,38 @@ struct ChatMessage {
 }
 
 #[derive(Serialize)]
+struct ObjectIDs {
+    id1: u32,
+    id2: u32
+}
+
+#[derive(Serialize, FromPrimitive, Debug, PartialEq)]
+enum SelectionMode {
+    ADD = 0x01,
+    REMOVE = 0x02
+}
+
+#[derive(Serialize)]
+#[derive(Default)]
 struct ActionData {
     #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<MinimapLocation>,
+    location: Option<MapLocation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    savegame_name: Option<String>
+    savegame_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unknownA: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unknownB: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objects: Option<Vec<ObjectIDs>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ability_flags: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sel_mode: Option<SelectionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_id: Option<u8>
 }
 
 #[derive(Serialize)]
@@ -202,6 +237,13 @@ fn cursor_read_dword<T>(cursor: &mut Cursor<T>) -> u32 where T: AsRef<[u8]> {
     return parse_dword(&buf);
 }
 
+fn cursor_read_dword_float<T>(cursor: &mut Cursor<T>) -> f32 where T: AsRef<[u8]> {
+    let mut buf = [0u8; 4];
+    cursor.read_exact(&mut buf).unwrap();
+    buf.reverse();
+    return f32::from_be_bytes(buf);
+}
+
 fn cursor_read_word<T>(cursor: &mut Cursor<T>) -> u16 where T: AsRef<[u8]> {
     let mut buf = [0u8; 2];
     cursor.read_exact(&mut buf).unwrap();
@@ -214,6 +256,14 @@ fn cursor_read_nullterminated_string<T>(cursor: &mut Cursor<T>) -> String where 
 
     let string = String::from_utf8_lossy(&string_buf[..string_buf.len()-1]);
     return string.to_string()
+}
+
+fn cursor_read_string<T>(cursor: &mut Cursor<T>, len: usize) -> String where T: AsRef<[u8]> {
+    let mut string_buf: Vec<u8> = vec![0u8; len];
+    cursor.read_exact(&mut string_buf).unwrap();
+    let string = String::from_utf8_lossy(&string_buf);
+    info!("Read string: {:?} {}", string_buf, string);
+    return string.to_string();
 }
 
 pub fn cursor_read_byte<T>(cursor: &mut Cursor<T>) -> u8 where T: AsRef<[u8]> {
@@ -581,18 +631,72 @@ impl Replay {
                                     0x06 => {
                                         let savegame_name = cursor_read_nullterminated_string(&mut cursor);
                                         action.data = Option::from(ActionData {
-                                            location: None,
                                             savegame_name: Option::from(savegame_name),
+                                            ..Default::default()
                                         })
                                     },
                                     0x07 => {
                                         cursor_skip_bytes(&mut cursor, 4);
                                     },
                                     0x10 => {
-                                       cursor_skip_bytes(&mut cursor, 14);
+                                        let flags = cursor_read_word(&mut cursor);
+
+                                        let item_id: String;
+                                        cursor_skip_bytes(&mut cursor, 2);
+                                        let item_id_end = cursor_read_word(&mut cursor);
+                                        cursor_skip_bytes(&mut cursor, -4);
+
+                                        if item_id_end == 0x000D {
+                                            item_id = cursor_read_string(&mut cursor, 2);
+                                            cursor_skip_bytes(&mut cursor, 2);
+                                        }
+                                        else {
+                                            item_id = cursor_read_string(&mut cursor, 4);
+                                        }
+
+                                        let unk_a = cursor_read_dword(&mut cursor);
+                                        let unk_b = cursor_read_dword(&mut cursor);
+
+                                        action.data = Option::from(ActionData {
+                                            item_id: Option::from(item_id.chars().rev().collect::<String>()),
+                                            ability_flags: Option::from(flags),
+                                            unknownA: Option::from(unk_a),
+                                            unknownB: Option::from(unk_b),
+                                            ..Default::default()
+                                        })
                                     },
-                                    0x11 => {
-                                        cursor_skip_bytes(&mut cursor, 22);
+                                    0x11 => {let flags = cursor_read_word(&mut cursor);
+
+                                        let item_id: String;
+                                        cursor_skip_bytes(&mut cursor, 2);
+                                        let item_id_end = cursor_read_word(&mut cursor);
+                                        cursor_skip_bytes(&mut cursor, -4);
+
+                                        if item_id_end == 0x000D {
+                                            item_id = cursor_read_string(&mut cursor, 2);
+                                            cursor_skip_bytes(&mut cursor, 2);
+                                        }
+                                        else {
+                                            item_id = cursor_read_string(&mut cursor, 4);
+                                        }
+
+                                        let unk_a = cursor_read_dword(&mut cursor);
+                                        let unk_b = cursor_read_dword(&mut cursor);
+
+                                        let loc_x = cursor_read_dword_float(&mut cursor);
+                                        let loc_y = cursor_read_dword_float(&mut cursor);
+
+                                        action.data = Option::from(ActionData {
+                                            item_id: Option::from(item_id.chars().rev().collect::<String>()),
+                                            ability_flags: Option::from(flags),
+                                            location: Option::from(MapLocation {
+                                                x: loc_x,
+                                                y: loc_y
+                                            }),
+                                            unknownA: Option::from(unk_a),
+                                            unknownB: Option::from(unk_b),
+                                            ..Default::default()
+                                        })
                                     },
                                     0x12 => {
                                         cursor_skip_bytes(&mut cursor, 30);
@@ -606,12 +710,39 @@ impl Replay {
                                     0x16 => {
                                         let select_mode_byte = cursor_read_byte(&mut cursor);
                                         let num_units = cursor_read_word(&mut cursor);
-                                        cursor_skip_bytes(&mut cursor, 8*num_units as i64);
+                                        let mut ii: u16 = 0;
+                                        let mut objs: Vec<ObjectIDs> = vec![];
+                                        while(ii < num_units) {
+                                            objs.push(ObjectIDs {
+                                                id1: cursor_read_dword(&mut cursor),
+                                                id2: cursor_read_dword(&mut cursor),
+                                            });
+                                            ii += 1;
+                                        }
+                                        action.data = Option::from(ActionData {
+                                            sel_mode: SelectionMode::from_u8(select_mode_byte),
+                                            objects: Option::from(objs),
+                                            ..Default::default()
+                                        })
+                                        // cursor_skip_bytes(&mut cursor, 8*num_units as i64);
                                     },
                                     0x17 => {
                                         let group_num = cursor_read_byte(&mut cursor);
                                         let items_count = cursor_read_word(&mut cursor);
-                                        cursor_skip_bytes(&mut cursor, 8*items_count as i64);
+                                        let mut ii: u16 = 0;
+                                        let mut objs: Vec<ObjectIDs> = vec![];
+                                        while(ii < items_count) {
+                                            objs.push(ObjectIDs {
+                                                id1: cursor_read_dword(&mut cursor),
+                                                id2: cursor_read_dword(&mut cursor),
+                                            });
+                                            ii += 1;
+                                        }
+                                        action.data = Option::from(ActionData {
+                                            group_id: Some(group_num),
+                                            objects: Option::from(objs),
+                                            ..Default::default()
+                                        })
                                     },
                                     0x18 => {
                                         cursor_skip_bytes(&mut cursor, 2);
@@ -672,10 +803,10 @@ impl Replay {
                                         buf.resize(8, 0);
                                         cursor.read_exact(&mut buf).unwrap();
                                         let command = cursor_read_nullterminated_string(&mut cursor);
-                                        info!("Chat command: {} {:?}", command, buf);
+                                        info!("Chat command (time {}) (player {}): {} {:?}", current_timestamp, cur_action_player_id, command, buf);
 
                                         // W3C Replays: Chat messages stored here, but in other replays messages here might shadow chatmessages
-                                        if chat.iter().rfind(|el| el.message == command && el.timestamp.abs_diff(current_timestamp) < 500).is_none() {
+                                        if chat.iter().rfind(|el| el.sender_player_id == cur_action_player_id && el.message == command && el.timestamp.abs_diff(current_timestamp) < 500).is_none() {
                                             chat.push(ChatMessage {
                                                 message: command,
                                                 timestamp: current_timestamp,
@@ -692,14 +823,14 @@ impl Replay {
                                     0x66 => {},
                                     0x67 => {},
                                     0x68 => {
-                                        let x = cursor_read_dword(&mut cursor);
-                                        let y = cursor_read_dword(&mut cursor);
+                                        let x = cursor_read_dword_float(&mut cursor);
+                                        let y = cursor_read_dword_float(&mut cursor);
                                         action.data = Option::from(ActionData {
-                                            location: Option::from(MinimapLocation {
+                                            location: Option::from(MapLocation {
                                                 x,
                                                 y
                                             }),
-                                            savegame_name: None
+                                            ..Default::default()
                                         })
                                     },
                                     0x69 => {
@@ -732,7 +863,9 @@ impl Replay {
                                     }
                                 }
 
-                                actions.push(action);
+                                if action.action_type != ActionType::UNKNOWN {
+                                    actions.push(action);
+                                }
 
                                 let cur_bytes = (cursor.position().clone() - cur_position_before_read) as u16;
                                 cur_read_bytes += cur_bytes;
