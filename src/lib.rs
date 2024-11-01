@@ -1,8 +1,7 @@
 mod utils;
-mod replay;
 
 use wasm_bindgen::prelude::*;
-use crate::replay::Replay;
+use replay::Replay;
 
 // When the `wee_alloc` feature is enabled, use `wee_alloc` as the global
 // allocator.
