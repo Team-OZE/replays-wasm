@@ -1,3 +1,4 @@
 [submodule "crates/replay-rs"]
 	path = crates/replay-rs
 	url = git@github.com:Team-OZE/replay-rs.git
+    branch = ltd
